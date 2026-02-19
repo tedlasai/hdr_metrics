@@ -12,7 +12,6 @@ import numpy as np
 from tqdm import tqdm  # progress bars
 
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 from metrics_helpers import (
     read_image, pre_hdr_p3, align_hdr_pred_to_gt,
@@ -56,7 +55,6 @@ gt_dir = os.path.join(EVAL_BASE, args.dataset, "hdr")
 pred_dir = os.path.join(EVAL_BASE, f"{args.method}_{args.dataset}", args.type)
 
 print(f"GT Directory: {gt_dir}")
-
 print(f"Pred Directory: {pred_dir}")
 
 NUM_FILES = 16  # for testing (200 for final)
