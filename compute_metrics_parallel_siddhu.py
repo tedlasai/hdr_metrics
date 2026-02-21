@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 from tqdm import tqdm  # progress bars
 
+# os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
 from metrics_helpers import (
@@ -25,7 +26,7 @@ from metrics_helpers import (
 # ----------------------------
 EVAL_BASE = "/home/tedlasai/hdrvideo/evaluations"
 DATASETS = ("stuttgart", "ubc")
-METHODS = ("lediff", "ours")
+METHODS = ("eilertsen", "lediff", "ours")
 
 
 def parse_args():

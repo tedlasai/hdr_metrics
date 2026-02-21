@@ -23,7 +23,7 @@ from typing import List, Optional, Tuple
 # Must match compute_metrics_parallel_siddhu.py
 EVAL_BASE = "/home/tedlasai/hdrvideo/evaluations"
 DATASETS = ("stuttgart", "ubc")
-METHODS = ("lediff", "ours")
+METHODS = ("eilertsen", "lediff", "ours")
 RESULTS_FILE = "results.csv"
 SCRIPT_NAME = "compute_metrics_parallel_siddhu.py"
 
