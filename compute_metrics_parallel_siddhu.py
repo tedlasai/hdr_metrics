@@ -7,12 +7,15 @@ import threading
 from pathlib import Path
 from itertools import islice
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
 
 import numpy as np
 from tqdm import tqdm  # progress bars
 
 # os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
+# Reduce CUDA fragmentation (helps with OOM when many models + threads use GPU)
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 from metrics_helpers import (
     read_image, pre_hdr_p3, align_hdr_pred_to_gt,
@@ -48,6 +51,13 @@ def parse_args():
         type=str,
         help="Subfolder under method (e.g. under)",
     )
+    parser.add_argument(
+        "--num-files",
+        type=int,
+        default=16,
+        metavar="N",
+        help="Number of frames per video (default 16). Output written to resultsN.csv.",
+    )
     return parser.parse_args()
 
 
@@ -58,13 +68,58 @@ pred_dir = os.path.join(EVAL_BASE, f"{args.method}_{args.dataset}", args.type)
 print(f"GT Directory: {gt_dir}")
 print(f"Pred Directory: {pred_dir}")
 
-NUM_FILES = 16  # for testing (200 for final)
+NUM_FILES = args.num_files  # e.g. 16 for testing, 200 for full run; output -> results{NUM_FILES}.csv
 
 video_paths = sorted([d for d in os.listdir(pred_dir) if os.path.isdir(os.path.join(pred_dir, d))])
 
-# Tune worker + in-flight window
-max_workers = min(16, (os.cpu_count() or 8))
-MAX_IN_FLIGHT = max_workers * 4  # keep this bounded to cap memory
+
+def _int_env(name: str, default: int, min_val: int = 1, max_val: int = 32) -> int:
+    """Read int from env with clamp; used so parent can force small workers via env."""
+    try:
+        v = int(os.environ.get(name, default))
+        return max(min_val, min(max_val, v))
+    except (TypeError, ValueError):
+        return default
+
+
+def get_cuda_free_mb() -> Optional[float]:
+    """Return free GPU memory in MB, or None if CUDA not used."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return None
+        if hasattr(torch.cuda, "mem_get_info"):
+            free, _ = torch.cuda.mem_get_info()
+            return free / (1024 ** 2)
+        total = torch.cuda.get_device_properties(0).total_memory
+        reserved = torch.cuda.memory_reserved(0)
+        return (total - reserved) / (1024 ** 2)
+    except Exception:
+        return None
+
+
+def _cuda_clear() -> None:
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+# Concurrency: parent (metric_gathering_sai) sets METRICS_MAX_WORKERS / METRICS_MAX_IN_FLIGHT
+# so --workers-per-gpu 1 or 2 actually limits per-process concurrency.
+max_workers = _int_env("METRICS_MAX_WORKERS", 1)
+MAX_IN_FLIGHT = _int_env("METRICS_MAX_IN_FLIGHT", 2)
+SAFETY_MB = _int_env("METRICS_SAFETY_MB", 1500, min_val=256, max_val=16000)
+
+# Log GPU and limits (so you can confirm 1 GPU and small worker count)
+_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "not set")
+print(f"CUDA_VISIBLE_DEVICES={_visible} | METRICS_MAX_WORKERS={max_workers} MAX_IN_FLIGHT={MAX_IN_FLIGHT}")
+free_mb = get_cuda_free_mb()
+if free_mb is not None:
+    print(f"GPU free memory at start: {free_mb:.0f} MB; backpressure threshold: {SAFETY_MB} MB")
 
 # ----------------------------
 # Initialize metrics (shared state)
@@ -212,31 +267,47 @@ for video_path in tqdm(video_paths, desc="Videos", unit="video"):
         pbar.close()
 
     # ----------------------------
-    # Update per-video metrics (main thread)
+    # Update per-video metrics. Clear GPU after frame phase so video-phase has headroom.
+    # Run CVVDP then FID/FVD. FID and FVD are updated in small chunks so we never
+    # put the full video on GPU at once (avoids 18+ GiB spike and OOM).
     # ----------------------------
+    gc.collect()
+    _cuda_clear()
+
+    # Frames per chunk for FID/FVD to cap peak GPU memory (env: METRICS_VIDEO_CHUNK)
+    video_chunk = _int_env("METRICS_VIDEO_CHUNK", 4, min_val=1, max_val=64)
+
     print("Computing CVVDP for video:", video_path)
     cvvdp_score = cvvdp(hdr_preds, hdr_gts, cvvdp_metric)
     cvvdp_scores.append(cvvdp_score)
     print("CVVDP Score:", cvvdp_score)
+    del hdr_preds, hdr_gts
+    gc.collect()
+    _cuda_clear()
 
     print("Updating FID for video:", video_path)
-    fid_update(reinhard_preds, reinhard_gts, reinhard_fid_metric)
-    fid_update(pu_preds, pu_gts, pu_fid_metric)
+    for start in range(0, len(reinhard_preds), video_chunk):
+        end = start + video_chunk
+        fid_update(reinhard_preds[start:end], reinhard_gts[start:end], reinhard_fid_metric)
+        _cuda_clear()
+    for start in range(0, len(pu_preds), video_chunk):
+        end = start + video_chunk
+        fid_update(pu_preds[start:end], pu_gts[start:end], pu_fid_metric)
+        _cuda_clear()
 
     print("Updating FVD for video:", video_path)
-    fvd_update(reinhard_preds, reinhard_gts, reinhard_fvd_metric)
-    fvd_update(pu_preds, pu_gts, pu_fvd_metric)
+    for start in range(0, len(reinhard_preds), video_chunk):
+        end = start + video_chunk
+        fvd_update(reinhard_preds[start:end], reinhard_gts[start:end], reinhard_fvd_metric)
+        _cuda_clear()
+    for start in range(0, len(pu_preds), video_chunk):
+        end = start + video_chunk
+        fvd_update(pu_preds[start:end], pu_gts[start:end], pu_fvd_metric)
+        _cuda_clear()
 
-    # Cleanup
-    del reinhard_preds, reinhard_gts, pu_preds, pu_gts, hdr_preds, hdr_gts, im_paths
+    del reinhard_preds, reinhard_gts, pu_preds, pu_gts, im_paths
     gc.collect()
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
+    _cuda_clear()
 
 # ----------------------------
 # Final metrics
@@ -275,7 +346,7 @@ HDR_VDP3_s = float(np.std(np.array(hdrvdp3_scores))) if len(hdrvdp3_scores) else
 CVVDP_s    = float(np.std(np.array(cvvdp_scores))) if len(cvvdp_scores) else float("nan")
 
 # --- write CSV ---
-out_csv = Path(pred_dir) / "results.csv"
+out_csv = Path(pred_dir) / f"results{NUM_FILES}.csv"
 fieldnames = [
     "CVVDP", "HDR-VDP3", "PU-PSNR", "PU-VSI", "PIQE", "LPIPS",
     "R-FID", "R-FVD", "PU-FID", "PU-FVD",

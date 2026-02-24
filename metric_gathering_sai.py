@@ -1,6 +1,7 @@
 """
 Run compute_metrics_parallel_siddhu.py for all (dataset, method, type) combinations
-that don't already have results.csv.
+that don't already have resultsN.csv. After a successful run, re-discovers and runs again
+until nothing is left to do (runs clean).
 
 GPU-parallel mode:
   --gpus 0,1,2,3  -> spawns pinned worker processes (CUDA_VISIBLE_DEVICES) and
@@ -24,8 +25,13 @@ from typing import List, Optional, Tuple
 EVAL_BASE = "/home/tedlasai/hdrvideo/evaluations"
 DATASETS = ("stuttgart", "ubc")
 METHODS = ("eilertsen", "lediff", "ours")
-RESULTS_FILE = "results.csv"
 SCRIPT_NAME = "compute_metrics_parallel_siddhu.py"
+
+
+def results_file_for(num_files: int) -> str:
+    """Results CSV name for a given num_files (e.g. results16.csv, results200.csv)."""
+    return f"results{num_files}.csv"
+
 
 Task = Tuple[str, str, str]  # (dataset, method, type)
 
@@ -38,8 +44,8 @@ def _script_path() -> Path:
     return _metrics_dir() / SCRIPT_NAME
 
 
-def discover_tasks() -> List[Task]:
-    """Scan EVAL_BASE and return (dataset, method, type) where results.csv is missing."""
+def discover_tasks(results_filename: str) -> List[Task]:
+    """Scan EVAL_BASE and return (dataset, method, type) where results_filename is missing."""
     tasks: List[Task] = []
     base = Path(EVAL_BASE)
     if not base.is_dir():
@@ -57,19 +63,25 @@ def discover_tasks() -> List[Task]:
             for type_dir in pred_parent.iterdir():
                 if not type_dir.is_dir():
                     continue
-                results_csv = type_dir / RESULTS_FILE
+                results_csv = type_dir / results_filename
                 if results_csv.is_file():
                     continue
                 tasks.append((dataset, method, type_dir.name))
     return sorted(tasks)
 
 
-def run_one_task(task: Task, gpu_id: Optional[str] = None) -> Tuple[Task, bool]:
+def run_one_task(
+    task: Task,
+    results_filename: str,
+    num_files: int,
+    gpu_id: Optional[str] = None,
+    workers_per_gpu: int = 1,
+) -> Tuple[Task, bool]:
     """Run compute_metrics_parallel_siddhu.py for one (dataset, method, type). Returns (task, success)."""
     dataset, method, type_name = task
 
     pred_dir = Path(EVAL_BASE) / f"{method}_{dataset}" / type_name
-    if (pred_dir / RESULTS_FILE).is_file():
+    if (pred_dir / results_filename).is_file():
         return (task, True)  # another process or server wrote it
 
     script = _script_path()
@@ -77,11 +89,15 @@ def run_one_task(task: Task, gpu_id: Optional[str] = None) -> Tuple[Task, bool]:
         print(f"Missing script: {script}", file=sys.stderr)
         return (task, False)
 
-    cmd = [sys.executable, str(script), dataset, method, type_name]
+    cmd = [sys.executable, str(script), dataset, method, type_name, "--num-files", str(num_files)]
 
     env = os.environ.copy()
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    # Force per-process concurrency so --workers-per-gpu 1 or 2 actually limits size
+    env["METRICS_MAX_WORKERS"] = "1"
+    env["METRICS_MAX_IN_FLIGHT"] = "1" if workers_per_gpu >= 2 else "2"
     if gpu_id is not None:
-        # Pin the subprocess to a single GPU.
+        # Pin the subprocess to a single GPU (only this GPU visible to the child)
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     try:
@@ -98,11 +114,19 @@ def run_one_task(task: Task, gpu_id: Optional[str] = None) -> Tuple[Task, bool]:
         return (task, False)
 
 
-def _gpu_worker(gpu_id: str, task_q: Queue, result_q: Queue) -> None:
+def _gpu_worker(
+    gpu_id: str,
+    task_q: Queue,
+    result_q: Queue,
+    results_filename: str,
+    num_files: int,
+    workers_per_gpu: int,
+) -> None:
     """
     One worker pinned to one GPU. It pulls tasks from task_q and reports to result_q.
+    Each subprocess is given METRICS_MAX_WORKERS=1 and small MAX_IN_FLIGHT so
+    --workers-per-gpu 1 or 2 actually limits how many processes share a GPU and how big each is.
     """
-    # Ensure any libraries imported in this process see only this GPU.
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     while True:
@@ -110,8 +134,23 @@ def _gpu_worker(gpu_id: str, task_q: Queue, result_q: Queue) -> None:
         if task is None:
             break
 
-        t, ok = run_one_task(task, gpu_id=gpu_id)
+        t, ok = run_one_task(
+            task, results_filename, num_files, gpu_id=gpu_id, workers_per_gpu=workers_per_gpu
+        )
         result_q.put((t, ok, gpu_id))
+
+
+def _apply_filters(tasks: List[Task], args: argparse.Namespace) -> List[Task]:
+    """Apply --method, --dataset, --types to task list."""
+    out = tasks
+    if args.method is not None:
+        out = [t for t in out if t[1] == args.method]
+    if args.dataset is not None:
+        out = [t for t in out if t[0] == args.dataset]
+    if args.types is not None:
+        allowed = {s.strip() for s in args.types.split(",") if s.strip()}
+        out = [t for t in out if t[2] in allowed]
+    return out
 
 
 def _parse_gpus(s: Optional[str]) -> Optional[List[str]]:
@@ -119,6 +158,68 @@ def _parse_gpus(s: Optional[str]) -> Optional[List[str]]:
         return None
     gpus = [x.strip() for x in s.split(",") if x.strip() != ""]
     return gpus if gpus else None
+
+
+def _run_round(
+    tasks: List[Task],
+    args: argparse.Namespace,
+    results_filename: str,
+) -> List[Task]:
+    """Run one round of tasks (GPU or CPU). Returns list of failed tasks (empty if all ok)."""
+    failed: List[Task] = []
+    gpus = _parse_gpus(args.gpus)
+
+    if gpus is not None:
+        task_q: Queue = Queue()
+        result_q: Queue = Queue()
+        workers_per_gpu = max(1, min(4, int(args.workers_per_gpu)))
+        total_workers = len(gpus) * workers_per_gpu
+        print(f"GPU mode: {len(gpus)} GPU(s) {gpus}, {workers_per_gpu} process(es) per GPU → {total_workers} total")
+
+        workers: List[Process] = []
+        for gpu_id in gpus:
+            for _ in range(workers_per_gpu):
+                p = Process(
+                    target=_gpu_worker,
+                    args=(gpu_id, task_q, result_q, results_filename, args.num_files, workers_per_gpu),
+                    daemon=True,
+                )
+                p.start()
+                workers.append(p)
+
+        for t in tasks:
+            task_q.put(t)
+        for _ in range(total_workers):
+            task_q.put(None)
+
+        remaining = len(tasks)
+        while remaining > 0:
+            t, ok, gpu_id = result_q.get()
+            dataset, method, type_name = t
+            if ok:
+                print(f"Done (gpu {gpu_id}): {dataset} / {method} / {type_name}")
+            else:
+                failed.append(t)
+                print(f"Failed (gpu {gpu_id}): {dataset} / {method} / {type_name}", file=sys.stderr)
+            remaining -= 1
+
+        for p in workers:
+            p.join()
+        return failed
+
+    workers = max(1, min(args.workers, len(tasks)))
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        futures = {
+            ex.submit(run_one_task, t, results_filename, args.num_files): t
+            for t in tasks
+        }
+        for fut in as_completed(futures):
+            (dataset, method, type_name), ok = fut.result()
+            if ok:
+                print(f"Done: {dataset} / {method} / {type_name}")
+            else:
+                failed.append((dataset, method, type_name))
+    return failed
 
 
 def parse_args():
@@ -181,24 +282,28 @@ def parse_args():
         action="store_true",
         help="Only print tasks that would be run, then exit.",
     )
+    parser.add_argument(
+        "--num-files",
+        type=int,
+        default=16,
+        metavar="N",
+        help="Number of frames per video; look for/write resultsN.csv (default 16).",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    all_tasks = discover_tasks()
-    tasks = all_tasks
+    results_filename = results_file_for(args.num_files)
 
-    if args.method is not None:
-        tasks = [t for t in tasks if t[1] == args.method]
-    if args.dataset is not None:
-        tasks = [t for t in tasks if t[0] == args.dataset]
     if args.types is not None:
         allowed = {s.strip() for s in args.types.split(",") if s.strip()}
-        tasks = [t for t in tasks if t[2] in allowed]
         if not allowed:
             print("No valid types in --types", file=sys.stderr)
             return 1
+
+    all_tasks = discover_tasks(results_filename)
+    tasks = _apply_filters(all_tasks, args)
 
     if args.list_types:
         seen = set()
@@ -208,88 +313,41 @@ def main():
                 seen.add(key)
                 print(f"  {t[0]} / {t[1]} / {t[2]}")
         print(
-            f"\nTotal: {len(tasks)} task(s) missing {RESULTS_FILE}. "
+            f"\nTotal: {len(tasks)} task(s) missing {results_filename}. "
             f"Use --types type1,type2,... to assign."
         )
         return 0
 
-    print(f"Discovered {len(all_tasks)} tasks missing {RESULTS_FILE}; running {len(tasks)} after filters.")
-    if not tasks:
-        print("Nothing to do.")
-        return 0
+    round_num = 0
+    while True:
+        round_num += 1
+        all_tasks = discover_tasks(results_filename)
+        tasks = _apply_filters(all_tasks, args)
 
-    for t in tasks:
-        print(f"  {t[0]} / {t[1]} / {t[2]}")
-    if args.dry_run:
-        return 0
+        if not tasks:
+            if round_num == 1:
+                print("Nothing to do.")
+            else:
+                print("All done; nothing left to run.")
+            return 0
 
-    gpus = _parse_gpus(args.gpus)
-    failed: List[Task] = []
+        if round_num > 1:
+            print(f"Round {round_num}: {len(tasks)} task(s) still missing {results_filename}.")
+        else:
+            print(
+                f"Discovered {len(tasks)} tasks missing {results_filename}; "
+                f"running {len(tasks)} after filters."
+            )
 
-    # -------------------------
-    # GPU-parallel mode
-    # -------------------------
-    if gpus is not None:
-        task_q: Queue = Queue()
-        result_q: Queue = Queue()
-
-        workers_per_gpu = max(1, int(args.workers_per_gpu))
-        total_workers = len(gpus) * workers_per_gpu
-
-        # Start K workers per GPU
-        workers: List[Process] = []
-        for gpu_id in gpus:
-            for _ in range(workers_per_gpu):
-                p = Process(target=_gpu_worker, args=(gpu_id, task_q, result_q), daemon=True)
-                p.start()
-                workers.append(p)
-
-        # Enqueue tasks
         for t in tasks:
-            task_q.put(t)
+            print(f"  {t[0]} / {t[1]} / {t[2]}")
 
-        # Send stop signals (one per worker process)
-        for _ in range(total_workers):
-            task_q.put(None)
+        if args.dry_run:
+            return 0
 
-        # Collect results
-        remaining = len(tasks)
-        while remaining > 0:
-            t, ok, gpu_id = result_q.get()
-            dataset, method, type_name = t
-            if ok:
-                print(f"Done (gpu {gpu_id}): {dataset} / {method} / {type_name}")
-            else:
-                failed.append(t)
-                print(f"Failed (gpu {gpu_id}): {dataset} / {method} / {type_name}", file=sys.stderr)
-            remaining -= 1
-
-        # Join workers
-        for p in workers:
-            p.join()
-
+        failed = _run_round(tasks, args, results_filename)
         if failed:
-            print("Failed:", failed, file=sys.stderr)
-            return 1
-        return 0
-
-    # -------------------------
-    # CPU-parallel mode (original behavior)
-    # -------------------------
-    workers = max(1, min(args.workers, len(tasks)))
-    with ProcessPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(run_one_task, t): t for t in tasks}
-        for fut in as_completed(futures):
-            (dataset, method, type_name), ok = fut.result()
-            if ok:
-                print(f"Done: {dataset} / {method} / {type_name}")
-            else:
-                failed.append((dataset, method, type_name))
-
-    if failed:
-        print("Failed:", failed, file=sys.stderr)
-        return 1
-    return 0
+            print("Some tasks failed (will retry next round):", failed, file=sys.stderr)
 
 
 if __name__ == "__main__":
