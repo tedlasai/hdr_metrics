@@ -31,9 +31,9 @@ def read_image(path):
     img = np.clip(img, 0, None)
     return img
 
-def initialize_cvvdp(display_name='ours_standard_hdr_linear', heatmap='threshold'):
-    cvvdp = pycvvdp.cvvdp(display_name=display_name, heatmap=heatmap)
-    return cvvdp
+def initialize_cvvdp(display_name='ours_standard_hdr_linear', heatmap='threshold', device=None):
+    cvvdp_obj = pycvvdp.cvvdp(display_name=display_name, heatmap=heatmap, device=device)
+    return cvvdp_obj
 
 def initialize_fid(device="cuda"):
     fid_metric = FrechetInceptionDistance(feature=64, normalize=True).to(device)
