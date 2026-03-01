@@ -1,7 +1,12 @@
 """
 Run compute_metrics_parallel_siddhu.py for all (dataset, method, type) combinations
-that don't already have resultsN.csv. After a successful run, re-discovers and runs again
-until nothing is left to do (runs clean).
+that don't already have their output CSV in EVAL_OUTPUT_DIR. After a successful run,
+re-discovers and runs again until nothing is left to do (runs clean).
+
+  --all          Run all methods (and all datasets/types); ignores --method/--dataset/--types.
+  --ds K         Downsampling: pass --ds K so the compute script uses every K-th frame
+                 (script reads each video dir and takes every K-th frame from disk).
+  --num-files N  Max frames per video; output CSV is results_{method}_{dataset}_{type}_N_dsK.csv.
 
 GPU-parallel mode:
   --gpus 0,1,2,3  -> spawns pinned worker processes (CUDA_VISIBLE_DEVICES) and
@@ -23,14 +28,15 @@ from typing import List, Optional, Tuple
 
 # Must match compute_metrics_parallel_siddhu.py
 EVAL_BASE = "/home/tedlasai/hdrvideo/evaluations"
+EVAL_OUTPUT_DIR = "/home/tedlasai/hdrvideo/evaluations_output"
 DATASETS = ("stuttgart", "ubc")
-METHODS = ("eilertsen", "lediff", "ours")
+METHODS = ("eilertsen", "lediff", "ours", "hdrtv", "santos")
 SCRIPT_NAME = "compute_metrics_parallel_siddhu.py"
 
 
-def results_file_for(num_files: int) -> str:
-    """Results CSV name for a given num_files (e.g. results16.csv, results200.csv)."""
-    return f"results{num_files}.csv"
+def results_file_for(method: str, dataset: str, type_name: str, num_files: int, ds: int) -> str:
+    """Results CSV basename written by compute_metrics_parallel_siddhu (e.g. results_ours_stuttgart_under_16_ds1.csv)."""
+    return f"results_{method}_{dataset}_{type_name}_{num_files}_ds{ds}.csv"
 
 
 Task = Tuple[str, str, str]  # (dataset, method, type)
@@ -44,10 +50,11 @@ def _script_path() -> Path:
     return _metrics_dir() / SCRIPT_NAME
 
 
-def discover_tasks(results_filename: str) -> List[Task]:
-    """Scan EVAL_BASE and return (dataset, method, type) where results_filename is missing."""
+def discover_tasks(num_files: int, ds: int) -> List[Task]:
+    """Scan EVAL_BASE for (method, dataset, type) dirs; return those missing the output CSV in EVAL_OUTPUT_DIR."""
     tasks: List[Task] = []
     base = Path(EVAL_BASE)
+    out_dir = Path(EVAL_OUTPUT_DIR)
     if not base.is_dir():
         return tasks
 
@@ -63,25 +70,26 @@ def discover_tasks(results_filename: str) -> List[Task]:
             for type_dir in pred_parent.iterdir():
                 if not type_dir.is_dir():
                     continue
-                results_csv = type_dir / results_filename
+                type_name = type_dir.name
+                results_csv = out_dir / results_file_for(method, dataset, type_name, num_files, ds)
                 if results_csv.is_file():
                     continue
-                tasks.append((dataset, method, type_dir.name))
+                tasks.append((dataset, method, type_name))
     return sorted(tasks)
 
 
 def run_one_task(
     task: Task,
-    results_filename: str,
     num_files: int,
+    ds: int,
     gpu_id: Optional[str] = None,
     workers_per_gpu: int = 1,
 ) -> Tuple[Task, bool]:
     """Run compute_metrics_parallel_siddhu.py for one (dataset, method, type). Returns (task, success)."""
     dataset, method, type_name = task
 
-    pred_dir = Path(EVAL_BASE) / f"{method}_{dataset}" / type_name
-    if (pred_dir / results_filename).is_file():
+    out_csv = Path(EVAL_OUTPUT_DIR) / results_file_for(method, dataset, type_name, num_files, ds)
+    if out_csv.is_file():
         return (task, True)  # another process or server wrote it
 
     script = _script_path()
@@ -89,7 +97,7 @@ def run_one_task(
         print(f"Missing script: {script}", file=sys.stderr)
         return (task, False)
 
-    cmd = [sys.executable, str(script), dataset, method, type_name, "--num-files", str(num_files)]
+    cmd = [sys.executable, str(script), dataset, method, type_name, "--num-files", str(num_files), "--ds", str(ds)]
 
     env = os.environ.copy()
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -118,8 +126,8 @@ def _gpu_worker(
     gpu_id: str,
     task_q: Queue,
     result_q: Queue,
-    results_filename: str,
     num_files: int,
+    ds: int,
     workers_per_gpu: int,
 ) -> None:
     """
@@ -135,13 +143,15 @@ def _gpu_worker(
             break
 
         t, ok = run_one_task(
-            task, results_filename, num_files, gpu_id=gpu_id, workers_per_gpu=workers_per_gpu
+            task, num_files, ds, gpu_id=gpu_id, workers_per_gpu=workers_per_gpu
         )
         result_q.put((t, ok, gpu_id))
 
 
 def _apply_filters(tasks: List[Task], args: argparse.Namespace) -> List[Task]:
-    """Apply --method, --dataset, --types to task list."""
+    """Apply --method, --dataset, --types to task list. If --all, return tasks unfiltered."""
+    if getattr(args, "all", False):
+        return tasks
     out = tasks
     if args.method is not None:
         out = [t for t in out if t[1] == args.method]
@@ -163,7 +173,8 @@ def _parse_gpus(s: Optional[str]) -> Optional[List[str]]:
 def _run_round(
     tasks: List[Task],
     args: argparse.Namespace,
-    results_filename: str,
+    num_files: int,
+    ds: int,
 ) -> List[Task]:
     """Run one round of tasks (GPU or CPU). Returns list of failed tasks (empty if all ok)."""
     failed: List[Task] = []
@@ -181,7 +192,7 @@ def _run_round(
             for _ in range(workers_per_gpu):
                 p = Process(
                     target=_gpu_worker,
-                    args=(gpu_id, task_q, result_q, results_filename, args.num_files, workers_per_gpu),
+                    args=(gpu_id, task_q, result_q, num_files, ds, workers_per_gpu),
                     daemon=True,
                 )
                 p.start()
@@ -210,7 +221,7 @@ def _run_round(
     workers = max(1, min(args.workers, len(tasks)))
     with ProcessPoolExecutor(max_workers=workers) as ex:
         futures = {
-            ex.submit(run_one_task, t, results_filename, args.num_files): t
+            ex.submit(run_one_task, t, num_files, ds): t
             for t in tasks
         }
         for fut in as_completed(futures):
@@ -287,24 +298,39 @@ def parse_args():
         type=int,
         default=16,
         metavar="N",
-        help="Number of frames per video; look for/write resultsN.csv (default 16).",
+        help="Max frames per video; output CSV includes N (default 16).",
+    )
+    parser.add_argument(
+        "--ds", "--downsampling",
+        type=int,
+        default=1,
+        dest="ds",
+        metavar="K",
+        help="Downsample: use every K-th frame (script reads dir and takes every K-th, default 1).",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Run all methods (and all datasets/types). Ignores --method/--dataset/--types.",
     )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    results_filename = results_file_for(args.num_files)
+    num_files = args.num_files
+    ds = max(1, args.ds)
 
-    if args.types is not None:
+    if args.types is not None and not getattr(args, "all", False):
         allowed = {s.strip() for s in args.types.split(",") if s.strip()}
         if not allowed:
             print("No valid types in --types", file=sys.stderr)
             return 1
 
-    all_tasks = discover_tasks(results_filename)
+    all_tasks = discover_tasks(num_files, ds)
     tasks = _apply_filters(all_tasks, args)
 
+    out_pattern = f"results_*_*_*_{num_files}_ds{ds}.csv"
     if args.list_types:
         seen = set()
         for t in tasks:
@@ -313,15 +339,15 @@ def main():
                 seen.add(key)
                 print(f"  {t[0]} / {t[1]} / {t[2]}")
         print(
-            f"\nTotal: {len(tasks)} task(s) missing {results_filename}. "
-            f"Use --types type1,type2,... to assign."
+            f"\nTotal: {len(tasks)} task(s) missing output CSV ({out_pattern} in {EVAL_OUTPUT_DIR}). "
+            f"Use --types type1,type2,... to limit, or --all for all methods."
         )
         return 0
 
     round_num = 0
     while True:
         round_num += 1
-        all_tasks = discover_tasks(results_filename)
+        all_tasks = discover_tasks(num_files, ds)
         tasks = _apply_filters(all_tasks, args)
 
         if not tasks:
@@ -332,10 +358,10 @@ def main():
             return 0
 
         if round_num > 1:
-            print(f"Round {round_num}: {len(tasks)} task(s) still missing {results_filename}.")
+            print(f"Round {round_num}: {len(tasks)} task(s) still missing output CSV.")
         else:
             print(
-                f"Discovered {len(tasks)} tasks missing {results_filename}; "
+                f"Discovered {len(tasks)} tasks missing output CSV; "
                 f"running {len(tasks)} after filters."
             )
 
@@ -345,7 +371,7 @@ def main():
         if args.dry_run:
             return 0
 
-        failed = _run_round(tasks, args, results_filename)
+        failed = _run_round(tasks, args, num_files, ds)
         if failed:
             print("Some tasks failed (will retry next round):", failed, file=sys.stderr)
 

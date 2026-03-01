@@ -25,11 +25,12 @@ from metrics_helpers import (
 )
 
 # ----------------------------
-# Config
+# Config (must match metric_gathering_sai.py: output CSVs flat in EVAL_OUTPUT_DIR)
 # ----------------------------
 EVAL_BASE = "/home/tedlasai/hdrvideo/evaluations"
+EVAL_OUTPUT_DIR = "/home/tedlasai/hdrvideo/evaluations_output"
 DATASETS = ("stuttgart", "ubc")
-METHODS = ("eilertsen", "lediff", "ours")
+METHODS = ("eilertsen", "lediff", "ours", "hdrtv", "santos")
 
 
 def parse_args():
@@ -56,7 +57,15 @@ def parse_args():
         type=int,
         default=16,
         metavar="N",
-        help="Number of frames per video (default 16). Output written to resultsN.csv.",
+        help="Max frames per video (default 16). Output: results_{method}_{dataset}_{type}_N_dsK.csv",
+    )
+    parser.add_argument(
+        "--ds", "--downsample", "--downsampling",
+        type=int,
+        default=1,
+        dest="ds",
+        metavar="K",
+        help="Use every K-th frame from dir (default 1). Reads dir and takes every K-th frame, not assumed.",
     )
     return parser.parse_args()
 
@@ -67,9 +76,10 @@ pred_dir = os.path.join(EVAL_BASE, f"{args.method}_{args.dataset}", args.type)
 
 print(f"GT Directory: {gt_dir}")
 print(f"Pred Directory: {pred_dir}")
+print(f"Downsample: every {args.ds}-th frame (from what is in each video dir)")
 
-NUM_FILES = args.num_files  # e.g. 16 for testing, 200 for full run; output -> results{NUM_FILES}.csv
-
+NUM_FILES = args.num_files
+DS = max(1, args.ds)
 video_paths = sorted([d for d in os.listdir(pred_dir) if os.path.isdir(os.path.join(pred_dir, d))])
 
 
@@ -154,7 +164,9 @@ def process_one_frame(idx, pred_im_path, gt_im_path):
     cv2_hdr_pred = read_image(pred_im_path)
     cv2_hdr_gt = read_image(gt_im_path)
     cv2_hdr_gt = pre_hdr_p3(cv2_hdr_gt)
-    cv2_hdr_pred, cv2_hdr_gt, _ = align_hdr_pred_to_gt(cv2_hdr_pred, cv2_hdr_gt)
+    cv2_hdr_pred, cv2_hdr_gt, _ = align_hdr_pred_to_gt(
+        cv2_hdr_pred, cv2_hdr_gt, fallback_on_lstsq_error=True,
+    )
 
     hdrvdp3_val = hdr_vdp3(cv2_hdr_pred, cv2_hdr_gt)
 
@@ -189,14 +201,54 @@ def process_one_frame(idx, pred_im_path, gt_im_path):
     }
 
 
+def get_frame_list(pred_video_dir: str, num_files: int, ds: int):
+    """List frames in dir, take every ds-th, cap at num_files. Downscaling from what is on disk."""
+    all_frames = sorted(os.listdir(pred_video_dir))
+    downsampled = all_frames[::ds][:num_files]
+    return downsampled
+
+
+def _write_per_video_csv(
+    out_path: Path,
+    cvvdp_val: float,
+    video_psnr: list,
+    video_vsi: list,
+    video_piqe: list,
+    video_lpips: list,
+    video_hdrvdp3: list,
+) -> None:
+    """Write one CSV for a single video: header then one row (PU-PSNR, PU-VSI, PIQE, LPIPS, HDR-VDP3, CVVDP)."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    n = len(video_psnr)
+    fieldnames = ["PU-PSNR", "PU-VSI", "PIQE", "LPIPS", "HDR-VDP3", "CVVDP"]
+    row = {
+        "PU-PSNR": float(np.mean(video_psnr)) if n else float("nan"),
+        "PU-VSI": float(np.mean(video_vsi)) if n else float("nan"),
+        "PIQE": float(np.mean(video_piqe)) if n else float("nan"),
+        "LPIPS": float(np.mean(video_lpips)) if n else float("nan"),
+        "HDR-VDP3": float(np.mean(video_hdrvdp3)) if n else float("nan"),
+        "CVVDP": cvvdp_val,
+    }
+    with open(out_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerow(row)
+
+
 for video_path in tqdm(video_paths, desc="Videos", unit="video"):
     pred_video_dir = os.path.join(pred_dir, video_path)
     gt_video_dir   = os.path.join(gt_dir, video_path)
 
-    im_paths = sorted(os.listdir(pred_video_dir))[:NUM_FILES]
-    assert len(im_paths) == NUM_FILES, (
-        f"Expected {NUM_FILES} frames, found {len(im_paths)} in {pred_video_dir}"
-    )
+    im_paths = get_frame_list(pred_video_dir, NUM_FILES, DS)
+    if not im_paths:
+        raise FileNotFoundError(f"No frames (after ds={DS}) in {pred_video_dir}")
+
+    # Per-video accumulators (for this video only)
+    video_psnr = []
+    video_vsi = []
+    video_piqe = []
+    video_lpips = []
+    video_hdrvdp3 = []
 
     # Pre-allocate lists so you keep order for video metrics
     # reinhard_preds = [None] * len(im_paths)
@@ -238,7 +290,12 @@ for video_path in tqdm(video_paths, desc="Videos", unit="video"):
                 hdr_preds[idx]      = out["cv2_hdr_pred"]
                 hdr_gts[idx]        = out["cv2_hdr_gt"]
 
-                # Append scalar metrics
+                # Per-video and global scalar metrics
+                video_psnr.append(out["pu_psnr"])
+                video_vsi.append(out["pu_vsi"])
+                video_piqe.append(out["pu_piqe"])
+                video_lpips.append(out["pu_lpips"])
+                video_hdrvdp3.append(out["hdrvdp3"])
                 psnr_scores.append(out["pu_psnr"])
                 vsi_scores.append(out["pu_vsi"])
                 piqe_scores.append(out["pu_piqe"])
@@ -300,6 +357,19 @@ for video_path in tqdm(video_paths, desc="Videos", unit="video"):
     gc.collect()
     _cuda_clear()
 
+    # Per-video CSV: results_{method}_{dataset}_{type}_{video_name}_{num_files}_ds{ds}.csv
+    per_video_csv = Path(EVAL_OUTPUT_DIR) / f"results_{args.method}_{args.dataset}_{args.type}_{video_path}_{NUM_FILES}_ds{DS}.csv"
+    _write_per_video_csv(
+        per_video_csv,
+        cvvdp_score,
+        video_psnr,
+        video_vsi,
+        video_piqe,
+        video_lpips,
+        video_hdrvdp3,
+    )
+    print(f"Wrote: {per_video_csv}")
+
     print("Updating FID for video:", video_path)
     # for start in range(0, len(reinhard_preds), video_chunk):
     #     end = start + video_chunk
@@ -358,8 +428,9 @@ LPIPS_s    = float(np.std(np.array(lpips_scores))) if len(lpips_scores) else flo
 HDR_VDP3_s = float(np.std(np.array(hdrvdp3_scores))) if len(hdrvdp3_scores) else float("nan")
 CVVDP_s    = float(np.std(np.array(cvvdp_scores))) if len(cvvdp_scores) else float("nan")
 
-# --- write CSV ---
-out_csv = Path(pred_dir) / f"results{NUM_FILES}.csv"
+# --- write CSV (must match metric_gathering_sai.py discovery) ---
+out_csv = Path(EVAL_OUTPUT_DIR) / f"results_{args.method}_{args.dataset}_{args.type}_{NUM_FILES}_ds{DS}.csv"
+Path(EVAL_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 fieldnames = [
     "CVVDP", "HDR-VDP3", "PU-PSNR", "PU-VSI", "PIQE", "LPIPS",
     "R-FID", "R-FVD", "PU-FID", "PU-FVD",
