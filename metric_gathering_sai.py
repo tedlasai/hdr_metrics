@@ -30,7 +30,7 @@ from typing import List, Optional, Tuple
 EVAL_BASE = "/home/tedlasai/hdrvideo/evaluations"
 EVAL_OUTPUT_DIR = "/home/tedlasai/hdrvideo/evaluations_output"
 DATASETS = ("stuttgart", "ubc")
-METHODS = ("eilertsen", "lediff", "ours", "hdrtv", "santos")
+METHODS = ("eilertsen", "lediff", "ours", "hdrtv", "santos", "oursfeb20")
 SCRIPT_NAME = "compute_metrics_parallel_siddhu.py"
 
 

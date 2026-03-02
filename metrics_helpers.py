@@ -165,7 +165,7 @@ def pre_hdr_p3(img):
     out = (img - p_low) * (d - c) / (p_high - p_low + eps) + c
 
     # clamp negative values
-    out = np.maximum(out, 0)
+    out = np.clip(out, c, d)
 
     return out
 
