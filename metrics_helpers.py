@@ -1,6 +1,12 @@
 import sys
-path_hdr_vdp3 = "./jpeg-ai-qaf-feature-HDR-VDP2.2-main"
-sys.path.append(path_hdr_vdp3)  
+from pathlib import Path
+
+_metrics_dir = Path(__file__).resolve().parent
+path_hdr_vdp3 = _metrics_dir / "jpeg-ai-qaf-feature-HDR-VDP2.2-main"
+sys.path.insert(0, str(path_hdr_vdp3))
+# pycvvdp lives inside ColorVideoVDP (import as pycvvdp)
+sys.path.insert(0, str(_metrics_dir / "ColorVideoVDP"))
+
 from VDP3.hdrvdp3 import hdrvdp3
 from pu21 import PU21Encoder
 from vsi import m_vsi
@@ -103,6 +109,10 @@ def fid_update(pred_video, gt_video, fid_metric):
 def fvd_update(pred_video, gt_video, fvd_metric):
     pred_video = np.stack(pred_video, axis=0)  # (T, H, W, C)
     gt_video = np.stack(gt_video, axis=0)      # (T, H, W, C)
+
+    # VideoMAE (cdfvd) internally divides by 255; it expects pixel range [0, 255].
+    pred_video = (np.clip(pred_video, 0, 1) * 255.0).astype(np.float32)
+    gt_video = (np.clip(gt_video, 0, 1) * 255.0).astype(np.float32)
 
     fvd_metric.add_fake_stats(pred_video[None, :])  # Add batch dimension
     fvd_metric.add_real_stats(gt_video[None, :])    # Add batch dimension

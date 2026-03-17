@@ -27,10 +27,10 @@ from metrics_helpers import (
 # ----------------------------
 # Config
 # ----------------------------
-EVAL_BASE = "/home/tedlasai/hdrvideo/evaluations"
-EVAL_OUTPUT_DIR = "/home/tedlasai/hdrvideo/evaluations_output"
+EVAL_BASE = "/projects/gencamedit/hdreval/evaluations"
+EVAL_OUTPUT_DIR = "/projects/gencamedit/hdreval/evaluations_output"
 DATASETS = ("stuttgart", "ubc")
-METHODS = ("eilertsen", "lediff", "ours", "hdrtv", "santos", "oursfeb20")
+METHODS = ("eilertsen", "lediff", "ours", "hdrtv", "santos", "oursfeb20", "eilertsenfeb")
 
 
 def parse_args():
@@ -55,7 +55,7 @@ def parse_args():
     parser.add_argument(
         "--num-files",
         type=int,
-        default=16,
+        default=17,
         metavar="N",
         help="Number of frames per video (default 16). Output written to results_{method}_{dataset}_{type}_N_dsK.csv.",
     )

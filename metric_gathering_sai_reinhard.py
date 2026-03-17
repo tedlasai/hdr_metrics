@@ -1,12 +1,12 @@
 """
-Run compute_metrics_parallel_siddhu.py for all (dataset, method, type) combinations
+Run compute_metrics_parallel_siddhu_reinhard.py for all (dataset, method, type) combinations
 that don't already have their output CSV in EVAL_OUTPUT_DIR. After a successful run,
 re-discovers and runs again until nothing is left to do (runs clean).
 
-  --all          Run all methods; ignores --method but still respects --dataset/--types.
+  --all          Run all methods (and all datasets/types); ignores --method/--dataset/--types.
   --ds K         Downsampling: pass --ds K so the compute script uses every K-th frame
                  (script reads each video dir and takes every K-th frame from disk).
-  --num-files N  Max frames per video; output CSV is results_{method}_{dataset}_{type}_N_dsK.csv.
+  --num-files N  Max frames per video; output CSV is results_{method}_{dataset}_{type}_N_dsK_reinhard.csv.
 
 GPU-parallel mode:
   --gpus 0,1,2,3  -> spawns pinned worker processes (CUDA_VISIBLE_DEVICES) and
@@ -26,17 +26,17 @@ from multiprocessing import Process, Queue
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-# Must match compute_metrics_parallel_siddhu.py
+# Must match compute_metrics_parallel_siddhu_reinhard.py
 EVAL_BASE = "/projects/gencamedit/hdreval/evaluations"
 EVAL_OUTPUT_DIR = "/projects/gencamedit/hdreval/evaluations_output"
 DATASETS = ("stuttgart", "ubc")
 METHODS = ("eilertsen", "lediff", "ours", "hdrtv", "santos", "oursfeb20", "eilertsenfeb")
-SCRIPT_NAME = "compute_metrics_parallel_siddhu.py"
+SCRIPT_NAME = "compute_metrics_parallel_siddhu_reinhard.py"
 
 
 def results_file_for(method: str, dataset: str, type_name: str, num_files: int, ds: int) -> str:
-    """Results CSV basename written by compute_metrics_parallel_siddhu (e.g. results_ours_stuttgart_under_16_ds1.csv)."""
-    return f"results_{method}_{dataset}_{type_name}_{num_files}_ds{ds}.csv"
+    """Results CSV basename written by compute_metrics_parallel_siddhu_reinhard (e.g. results_ours_stuttgart_under_17_ds1_reinhard.csv)."""
+    return f"results_{method}_{dataset}_{type_name}_{num_files}_ds{ds}_reinhard.csv"
 
 
 Task = Tuple[str, str, str]  # (dataset, method, type)
@@ -85,7 +85,7 @@ def run_one_task(
     gpu_id: Optional[str] = None,
     workers_per_gpu: int = 1,
 ) -> Tuple[Task, bool]:
-    """Run compute_metrics_parallel_siddhu.py for one (dataset, method, type). Returns (task, success)."""
+    """Run compute_metrics_parallel_siddhu_reinhard.py for one (dataset, method, type). Returns (task, success)."""
     dataset, method, type_name = task
 
     out_csv = Path(EVAL_OUTPUT_DIR) / results_file_for(method, dataset, type_name, num_files, ds)
@@ -155,15 +155,18 @@ def _is_santos_ubc_over(task: Task) -> bool:
 
 
 def _apply_filters(tasks: List[Task], args: argparse.Namespace) -> List[Task]:
-    """Apply --method, --dataset, --types to task list. --all overrides only --method (all methods)."""
-    out = tasks
-    if not getattr(args, "all", False) and args.method is not None:
-        out = [t for t in out if t[1] == args.method]
-    if args.dataset is not None:
-        out = [t for t in out if t[0] == args.dataset]
-    if args.types is not None:
-        allowed = {s.strip() for s in args.types.split(",") if s.strip()}
-        out = [t for t in out if t[2] in allowed]
+    """Apply --method, --dataset, --types. If --all, skip those filters. Santos ubc over is excluded unless --santosover (--all does not enable it)."""
+    if getattr(args, "all", False):
+        out = tasks
+    else:
+        out = tasks
+        if args.method is not None:
+            out = [t for t in out if t[1] == args.method]
+        if args.dataset is not None:
+            out = [t for t in out if t[0] == args.dataset]
+        if args.types is not None:
+            allowed = {s.strip() for s in args.types.split(",") if s.strip()}
+            out = [t for t in out if t[2] in allowed]
     # Exclude santos ubc over (e.g. over20) unless --santosover; --all does not enable it
     if not getattr(args, "santosover", False):
         out = [t for t in out if not _is_santos_ubc_over(t)]
@@ -242,7 +245,7 @@ def _run_round(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run metrics for all (dataset, method, type) missing results.csv. "
+        description="Run Reinhard metrics for all (dataset, method, type) missing results.csv. "
         "Use --method/--dataset/--types to limit work across servers."
     )
     parser.add_argument(
@@ -305,7 +308,7 @@ def parse_args():
         type=int,
         default=17,
         metavar="N",
-        help="Max frames per video; output CSV includes N (default 16).",
+        help="Max frames per video; output CSV includes N (default 17).",
     )
     parser.add_argument(
         "--ds", "--downsampling",
@@ -318,7 +321,7 @@ def parse_args():
     parser.add_argument(
         "--all",
         action="store_true",
-        help="Run all methods. Ignores --method but still respects --dataset/--types.",
+        help="Run all methods (and all datasets/types). Ignores --method/--dataset/--types.",
     )
     parser.add_argument(
         "--santosover",
@@ -342,7 +345,7 @@ def main():
     all_tasks = discover_tasks(num_files, ds)
     tasks = _apply_filters(all_tasks, args)
 
-    out_pattern = f"results_*_*_*_{num_files}_ds{ds}.csv"
+    out_pattern = f"results_*_*_*_{num_files}_ds{ds}_reinhard.csv"
     if args.list_types:
         seen = set()
         for t in tasks:
@@ -352,7 +355,7 @@ def main():
                 print(f"  {t[0]} / {t[1]} / {t[2]}")
         print(
             f"\nTotal: {len(tasks)} task(s) missing output CSV ({out_pattern} in {EVAL_OUTPUT_DIR}). "
-            f"Use --types type1,type2,... to limit types, or --all for all methods."
+            f"Use --types type1,type2,... to limit, or --all for all methods."
         )
         return 0
 
