@@ -19,7 +19,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 from metrics_helpers import (
     read_image, pre_hdr_p3, align_hdr_pred_to_gt,
-    psnr, vsi, piqe, lpips, hdr_vdp3, pu,
+    psnr, vsi, piqe, lpips, hdr_vdp3, pu, reinhard_tonemap,
     initialize_fid, initialize_fvd,
     compute_fid, fid_update, compute_fvd, fvd_update, cvvdp, initialize_cvvdp,fit_and_apply_crf
 )
@@ -107,16 +107,6 @@ def get_cuda_free_mb() -> Optional[float]:
         return None
 
 
-def _cuda_clear() -> None:
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
-
-
 # Concurrency: parent (metric_gathering_sai) sets METRICS_MAX_WORKERS / METRICS_MAX_IN_FLIGHT
 # so --workers-per-gpu 1 or 2 actually limits per-process concurrency.
 max_workers = _int_env("METRICS_MAX_WORKERS", 1)
@@ -134,8 +124,8 @@ if free_mb is not None:
 # Initialize metrics (shared state)
 # ----------------------------
 cvvdp_metric = initialize_cvvdp()
-# reinhard_fvd_metric = initialize_fvd()
-# reinhard_fid_metric = initialize_fid()
+reinhard_fvd_metric = initialize_fvd()
+reinhard_fid_metric = initialize_fid()
 pu_fvd_metric = initialize_fvd()
 pu_fid_metric = initialize_fid()
 
@@ -176,6 +166,10 @@ def process_one_frame(idx, pred_im_path, gt_im_path):
     denom = np.max(pu_gt) if np.max(pu_gt) > 0 else 1.0
     pu_pred_norm = pu_pred / denom
     pu_gt_norm = pu_gt / denom
+    
+    reinhard_pred = reinhard_tonemap(cv2_hdr_pred)
+    reinhard_gt   = reinhard_tonemap(cv2_hdr_gt)
+
     pu_pred_01 = np.clip(pu_pred_norm, 0.0, 1.0).astype(np.float32)
     pu_gt_01 = np.clip(pu_gt_norm, 0.0, 1.0).astype(np.float32)
 
@@ -189,8 +183,8 @@ def process_one_frame(idx, pred_im_path, gt_im_path):
         "idx": idx,
         "cv2_hdr_pred": cv2_hdr_pred,
         "cv2_hdr_gt": cv2_hdr_gt,
-        # "reinhard_pred": reinhard_pred,
-        # "reinhard_gt": reinhard_gt,
+        "reinhard_pred": reinhard_pred,
+        "reinhard_gt": reinhard_gt,
         "pu_pred_norm": pu_pred_norm,
         "pu_gt_norm": pu_gt_norm,
         "pu_psnr": pu_psnr,
@@ -219,8 +213,8 @@ for video_path in tqdm(video_paths, desc="Videos", unit="video"):
     v_hdrvdp3_scores = []
 
     # Pre-allocate lists so you keep order for video metrics
-    # reinhard_preds = [None] * len(im_paths)
-    # reinhard_gts   = [None] * len(im_paths)
+    reinhard_preds = [None] * len(im_paths)
+    reinhard_gts   = [None] * len(im_paths)
     pu_preds       = [None] * len(im_paths)
     pu_gts         = [None] * len(im_paths)
     hdr_preds      = [None] * len(im_paths)
@@ -251,8 +245,8 @@ for video_path in tqdm(video_paths, desc="Videos", unit="video"):
                 idx = out["idx"]
 
                 # Store for video-level metrics (keep order)
-                # reinhard_preds[idx] = out["reinhard_pred"]
-                # reinhard_gts[idx]   = out["reinhard_gt"]
+                reinhard_preds[idx] = out["reinhard_pred"]
+                reinhard_gts[idx]   = out["reinhard_gt"]
                 pu_preds[idx]       = out["pu_pred_norm"]
                 pu_gts[idx]         = out["pu_gt_norm"]
                 hdr_preds[idx]      = out["cv2_hdr_pred"]
@@ -291,33 +285,8 @@ for video_path in tqdm(video_paths, desc="Videos", unit="video"):
         pbar.close()
 
     # ----------------------------
-    # Update per-video metrics. Clear GPU after frame phase so video-phase has headroom.
-    # Run CVVDP then FID/FVD. FID and FVD are updated in small chunks so we never
-    # put the full video on GPU at once (avoids 18+ GiB spike and OOM).
+    # Update per-video metrics (main thread): CVVDP, then full-sequence FID/FVD
     # ----------------------------
-    gc.collect()
-    _cuda_clear()
-
-    # Frames per chunk for FID/FVD to cap peak GPU memory (env: METRICS_VIDEO_CHUNK)
-    video_chunk = _int_env("METRICS_VIDEO_CHUNK", 4, min_val=1, max_val=64)
-
-    # FVD requires T>=2 (VideoMAE tubelet_size=2). Build chunk ranges so no chunk has length 1.
-    def _fvd_chunk_ranges(n, chunk_size):
-        ranges = []
-        s = 0
-        while s < n:
-            e = min(s + chunk_size, n)
-            ranges.append((s, e))
-            s = e
-        # Merge any trailing 1-frame chunk into the previous chunk
-        while len(ranges) >= 2 and (ranges[-1][1] - ranges[-1][0]) == 1:
-            start_prev, _ = ranges[-2]
-            ranges[-2] = (start_prev, ranges[-1][1])
-            ranges.pop()
-        return ranges
-
-    fvd_ranges = _fvd_chunk_ranges(len(pu_preds), video_chunk)
-
     print("Computing CVVDP for video:", video_path)
     cvvdp_score = cvvdp(hdr_preds, hdr_gts, cvvdp_metric)
     cvvdp_scores.append(cvvdp_score)
@@ -344,52 +313,44 @@ for video_path in tqdm(video_paths, desc="Videos", unit="video"):
         writer.writerow(video_row)
 
     print(f"Wrote per-video: {out_csv_video}")
-    del hdr_preds, hdr_gts
-    gc.collect()
-    _cuda_clear()
 
     print("Updating FID for video:", video_path)
-    # for start in range(0, len(reinhard_preds), video_chunk):
-    #     end = start + video_chunk
-    #     fid_update(reinhard_preds[start:end], reinhard_gts[start:end], reinhard_fid_metric)
-    #     _cuda_clear()
-    for start in range(0, len(pu_preds), video_chunk):
-        end = start + video_chunk
-        fid_update(pu_preds[start:end], pu_gts[start:end], pu_fid_metric)
-        _cuda_clear()
+    fid_update(reinhard_preds, reinhard_gts, reinhard_fid_metric)
+    fid_update(pu_preds, pu_gts, pu_fid_metric)
 
     print("Updating FVD for video:", video_path)
-    # for start, end in fvd_ranges:
-    #     fvd_update(reinhard_preds[start:end], reinhard_gts[start:end], reinhard_fvd_metric)
-    #     _cuda_clear()
-    for start, end in fvd_ranges:
-        fvd_update(pu_preds[start:end], pu_gts[start:end], pu_fvd_metric)
-        _cuda_clear()
+    fvd_update(reinhard_preds, reinhard_gts, reinhard_fvd_metric)
+    fvd_update(pu_preds, pu_gts, pu_fvd_metric)
 
-    del pu_preds, pu_gts, im_paths
+    del reinhard_preds, reinhard_gts, pu_preds, pu_gts, hdr_preds, hdr_gts, im_paths
     gc.collect()
-    _cuda_clear()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 # ----------------------------
 # Final metrics
 # ----------------------------
-# print("R-FID Score:", compute_fid(reinhard_fid_metric))
-# print("R-FVD Score:", compute_fvd(reinhard_fvd_metric))
-print("PU-FID Score:", compute_fid(pu_fid_metric))
-print("PU-FVD Score:", compute_fvd(pu_fvd_metric))
+# --- compute aggregates once (single compute per metric; state is consumed) ---
+R_FID   = float(compute_fid(reinhard_fid_metric))
+R_FVD   = float(compute_fvd(reinhard_fvd_metric))
+PU_FID  = float(compute_fid(pu_fid_metric))
+PU_FVD  = float(compute_fvd(pu_fvd_metric))
 
+print("R-FID Score:", R_FID)
+print("R-FVD Score:", R_FVD)
+print("PU-FID Score:", PU_FID)
+print("PU-FVD Score:", PU_FVD)
 print("Average PU-PSNR:", float(np.mean(np.array(psnr_scores))))
 print("Average PU-VSI:",  float(np.mean(np.array(vsi_scores))))
 print("Average PIQE:",    float(np.mean(np.array(piqe_scores))))
 print("Average LPIPS:",   float(np.mean(np.array(lpips_scores))))
 print("Average HDR-VDP3:", float(np.mean(np.array(hdrvdp3_scores))))
 print("Average CVVDP:", float(np.mean(np.array(cvvdp_scores))))
-
-# --- compute aggregates once ---
-# R_FID   = float(compute_fid(reinhard_fid_metric))
-# R_FVD   = float(compute_fvd(reinhard_fvd_metric))
-PU_FID  = float(compute_fid(pu_fid_metric))
-PU_FVD  = float(compute_fvd(pu_fvd_metric))
 
 PU_PSNR = float(np.mean(np.array(psnr_scores))) if len(psnr_scores) else float("nan")
 PU_VSI  = float(np.mean(np.array(vsi_scores)))  if len(vsi_scores)  else float("nan")
@@ -411,12 +372,12 @@ out_csv = Path(EVAL_OUTPUT_DIR) / f"results_{args.method}_{args.dataset}_{args.t
 Path(EVAL_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 fieldnames = [
     "CVVDP", "HDR-VDP3", "PU-PSNR", "PU-VSI", "PIQE", "LPIPS",
-    "PU-FID", "PU-FVD",
+    "R-FID", "R-FVD", "PU-FID", "PU-FVD",
     "CVVDP-STD", "HDR-VDP3-STD", "PU-PSNR-STD", "PU-VSI-STD", "PIQE-STD", "LPIPS-STD",
 ]
 row = {
     "CVVDP": CVVDP, "HDR-VDP3": HDR_VDP3, "PU-PSNR": PU_PSNR, "PU-VSI": PU_VSI, "PIQE": PIQE, "LPIPS": LPIPS,
-    "PU-FID": PU_FID, "PU-FVD": PU_FVD,
+    "R-FID": R_FID, "R-FVD": R_FVD, "PU-FID": PU_FID, "PU-FVD": PU_FVD,
     "CVVDP-STD": CVVDP_s, "HDR-VDP3-STD": HDR_VDP3_s, "PU-PSNR-STD": PU_PSNR_s,
     "PU-VSI-STD": PU_VSI_s, "PIQE-STD": PIQE_s, "LPIPS-STD": LPIPS_s
 }
