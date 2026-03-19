@@ -127,7 +127,7 @@ def compute_fvd(fvd_metric):
     return float(fvd_metric.compute_fvd_from_stats())
 
 
-def align_hdr_pred_to_gt(pred, gt, percentile_low=10, percentile_high=90, eps=1e-8):
+def align_hdr_pred_to_gt(pred, gt, percentile_low=10, percentile_high=90, eps=1e-8, ab=None):
     """
     Align HDR prediction to GT using least-squares scale+bias (a, b),
     computed only on pixels whose GT luminance lies between given percentiles.
@@ -137,7 +137,12 @@ def align_hdr_pred_to_gt(pred, gt, percentile_low=10, percentile_high=90, eps=1e
     """
 
     pred = np.clip(pred, 0, None)
+    gt_clamped = np.clip(gt, 0, 1000)
 
+    if ab is not None:
+        a, b = float(ab[0]), float(ab[1])
+        aligned_pred = np.clip(pred * a + b, 0, 1000)
+        return aligned_pred, gt_clamped, (a, b)
     # Compute luminance mask from GT
     gt_lum = np.sum(gt, axis=2)
     p10, p90 = np.percentile(gt_lum, percentile_low), np.percentile(gt_lum, percentile_high)
@@ -157,7 +162,6 @@ def align_hdr_pred_to_gt(pred, gt, percentile_low=10, percentile_high=90, eps=1e
     aligned_pred = pred * a + b
     #clamp aligned pred and gt to 1000 max
     aligned_pred = np.clip(aligned_pred, 0, 1000)
-    gt_clamped = np.clip(gt, 0, 1000)
     return aligned_pred, gt_clamped, (a, b)
 
 def pre_hdr_p3(img):
@@ -219,6 +223,7 @@ def fit_and_apply_crf(
     down_factor=4,
     p_low=10,
     p_high=90,
+    coeffs=None,
 ):
     """
     Fit a per-channel polynomial CRF in log space (pred → gt) using
@@ -228,6 +233,16 @@ def fit_and_apply_crf(
     eps = 1
     H, W, C = pred.shape
     assert C == 3
+
+    if coeffs is not None:
+        coeffs = np.asarray(coeffs, dtype=np.float32)
+        assert coeffs.shape == (3, deg + 1)
+        pred_safe = np.clip(pred, eps, None)
+        log_p = np.log(pred_safe)
+        corrected = np.zeros_like(pred_safe)
+        for c in range(3):
+            corrected[..., c] = np.exp(np.polyval(coeffs[c], log_p[..., c]))
+        return corrected, coeffs
 
     # --- Downsample for fitting using INTER_AREA ---
     pred_fit = downsample_inter_area(pred, down_factor)
