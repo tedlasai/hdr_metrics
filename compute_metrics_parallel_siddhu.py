@@ -66,6 +66,20 @@ def parse_args():
         metavar="K",
         help="Downsample: use every K-th frame from each video dir (default 1).",
     )
+    parser.add_argument(
+        "--videos",
+        type=str,
+        default=None,
+        metavar="V1,V2,...",
+        help="Optional comma-separated video folder names to run (default: all videos).",
+    )
+    parser.add_argument(
+        "--videos-exclude",
+        type=str,
+        default=None,
+        metavar="V1,V2,...",
+        help="Optional comma-separated video folder names to exclude.",
+    )
     return parser.parse_args()
 
 
@@ -80,7 +94,24 @@ NUM_FILES = args.num_files  # max frames per video
 DS = max(1, args.ds)  # use every DS-th frame from each video dir
 
 video_paths = sorted([d for d in os.listdir(pred_dir) if os.path.isdir(os.path.join(pred_dir, d))])
-
+requested_videos = None
+if args.videos:
+    requested_videos = [v.strip() for v in args.videos.split(",") if v.strip()]
+    requested_set = set(requested_videos)
+    video_paths = [v for v in video_paths if v in requested_set]
+    if not video_paths:
+        raise ValueError(
+            f"No matching videos found for --videos={args.videos} under {pred_dir}"
+        )
+    print(f"Running limited video set ({len(video_paths)}): {video_paths}")
+if args.videos_exclude:
+    excluded_videos = {v.strip() for v in args.videos_exclude.split(",") if v.strip()}
+    video_paths = [v for v in video_paths if v not in excluded_videos]
+    if not video_paths:
+        raise ValueError(
+            f"No videos left after --videos-exclude={args.videos_exclude} under {pred_dir}"
+        )
+    print(f"Excluding videos: {sorted(excluded_videos)}")
 
 def _int_env(name: str, default: int, min_val: int = 1, max_val: int = 32) -> int:
     """Read int from env with clamp; used so parent can force small workers via env."""
@@ -128,6 +159,8 @@ reinhard_fvd_metric = initialize_fvd()
 reinhard_fid_metric = initialize_fid()
 pu_fvd_metric = initialize_fvd()
 pu_fid_metric = initialize_fid()
+reinhard_fvd_first_metric = initialize_fvd()
+pu_fvd_first_metric = initialize_fvd()
 
 # If fid_update is not thread-safe, you update it in the main thread (you already do).
 lpips_lock = threading.Lock()
@@ -143,16 +176,16 @@ hdrvdp3_scores = []
 cvvdp_scores = []
 
 
-def process_one_frame(idx, pred_im_path, gt_im_path):
+def process_one_frame(idx, pred_im_path, gt_im_path, ab_first, coeffs_first):
     """
     Runs all expensive per-frame computation.
     Returns everything needed by the main thread to:
       - store preds/gts for FVD/CVVDP
       - append scalar metrics
     """
-    cv2_hdr_pred = read_image(pred_im_path)
+    cv2_hdr_pred_raw = read_image(pred_im_path)
     # cv2_hdr_pred = "frame_0000.exr" #read_image(pred_im_path)
-
+    cv2_hdr_pred = cv2_hdr_pred_raw
     cv2_hdr_gt = read_image(gt_im_path)
     cv2_hdr_gt = pre_hdr_p3(cv2_hdr_gt)
     cv2_hdr_pred, cv2_hdr_gt, _ = align_hdr_pred_to_gt(cv2_hdr_pred, cv2_hdr_gt, percentile_low=20, percentile_high=80)
@@ -162,8 +195,25 @@ def process_one_frame(idx, pred_im_path, gt_im_path):
 
     pu_pred, pu_gt = pu(cv2_hdr_pred), pu(cv2_hdr_gt)
 
-    # Normalize PU frames by max(pu_gt) for [0,1] range (LPIPS and FID/FVD expect this)
+    cv2_hdr_pred_f_aligned, _, _ = align_hdr_pred_to_gt(
+        cv2_hdr_pred_raw,
+        cv2_hdr_gt,
+        ab=ab_first,
+    )
+
+    # 2) fixed CRF apply
+    cv2_hdr_pred_f, _ = fit_and_apply_crf(
+        cv2_hdr_pred_f_aligned,
+        cv2_hdr_gt,
+        coeffs=coeffs_first,
+    )
+
+    # 3) Reinhard + PU for FVD
+    reinhard_pred_f = reinhard_tonemap(cv2_hdr_pred_f)
+
     denom = np.max(pu_gt) if np.max(pu_gt) > 0 else 1.0
+    pu_pred_f = pu(cv2_hdr_pred_f)
+    pu_pred_norm_f = pu_pred_f / denom  # same denom as your normal path (pu_gt)
     pu_pred_norm = pu_pred / denom
     pu_gt_norm = pu_gt / denom
     
@@ -192,6 +242,8 @@ def process_one_frame(idx, pred_im_path, gt_im_path):
         "pu_piqe": pu_piqe,
         "pu_lpips": pu_lpips,
         "hdrvdp3": hdrvdp3_val,
+        "reinhard_pred_firstfit": reinhard_pred_f,
+        "pu_pred_norm_firstfit": pu_pred_norm_f,
     }
 
 
@@ -205,6 +257,25 @@ for video_path in tqdm(video_paths, desc="Videos", unit="video"):
         f"Expected at least 1 frame after downsampling (ds={DS}), found {len(im_paths)} in {pred_video_dir}"
     )
 
+    ALIGN_P_LO, ALIGN_P_HI = 20, 80 # 160
+    CRF_P_LO, CRF_P_HI = 0.1, 99.9 #161
+
+    im0 = im_paths[0]
+    pred0 = read_image(os.path.join(pred_video_dir, im0))
+    gt0 = pre_hdr_p3(read_image(os.path.join(gt_video_dir, im0)))
+
+    pred0_aligned, gt0_aligned, ab_first = align_hdr_pred_to_gt(
+        pred0, gt0,
+        percentile_low=ALIGN_P_LO,
+        percentile_high=ALIGN_P_HI,
+    )
+
+    _, coeffs_first = fit_and_apply_crf(
+        pred0_aligned, gt0_aligned,
+        p_low=CRF_P_LO,
+        p_high=CRF_P_HI,
+    )
+
     # Per-video scalar metric accumulators (written to per-video CSV)
     v_psnr_scores = []
     v_vsi_scores = []
@@ -215,8 +286,12 @@ for video_path in tqdm(video_paths, desc="Videos", unit="video"):
     # Pre-allocate lists so you keep order for video metrics
     reinhard_preds = [None] * len(im_paths)
     reinhard_gts   = [None] * len(im_paths)
+    reinhard_preds_firstfit = [None] * len(im_paths)
+    reinhard_gts_firstfit = [None] * len(im_paths)
     pu_preds       = [None] * len(im_paths)
     pu_gts         = [None] * len(im_paths)
+    pu_preds_firstfit = [None] * len(im_paths)
+    pu_gts_firstfit = [None] * len(im_paths)
     hdr_preds      = [None] * len(im_paths)
     hdr_gts        = [None] * len(im_paths)
 
@@ -232,7 +307,7 @@ for video_path in tqdm(video_paths, desc="Videos", unit="video"):
         for idx, im_name in islice(it, MAX_IN_FLIGHT):
             pred_im_path = os.path.join(pred_video_dir, im_name)
             gt_im_path   = os.path.join(gt_video_dir, im_name)
-            fut = ex.submit(process_one_frame, idx, pred_im_path, gt_im_path)
+            fut = ex.submit(process_one_frame, idx, pred_im_path, gt_im_path, ab_first, coeffs_first)
             futures[fut] = idx
 
         pbar = tqdm(total=len(im_paths), desc=f"Frames [{video_path}]", unit="frame", leave=False)
@@ -251,6 +326,8 @@ for video_path in tqdm(video_paths, desc="Videos", unit="video"):
                 pu_gts[idx]         = out["pu_gt_norm"]
                 hdr_preds[idx]      = out["cv2_hdr_pred"]
                 hdr_gts[idx]        = out["cv2_hdr_gt"]
+                reinhard_preds_firstfit[idx] = out["reinhard_pred_firstfit"]
+                pu_preds_firstfit[idx] = out["pu_pred_norm_firstfit"]
 
                 # Append scalar metrics
                 psnr_scores.append(out["pu_psnr"])
@@ -274,7 +351,7 @@ for video_path in tqdm(video_paths, desc="Videos", unit="video"):
                     idx2, im_name2 = next(it)
                     pred_im_path2 = os.path.join(pred_video_dir, im_name2)
                     gt_im_path2   = os.path.join(gt_video_dir, im_name2)
-                    fut2 = ex.submit(process_one_frame, idx2, pred_im_path2, gt_im_path2)
+                    fut2 = ex.submit(process_one_frame, idx2, pred_im_path2, gt_im_path2, ab_first, coeffs_first)
                     futures[fut2] = idx2
                 except StopIteration:
                     pass
@@ -321,6 +398,8 @@ for video_path in tqdm(video_paths, desc="Videos", unit="video"):
     print("Updating FVD for video:", video_path)
     fvd_update(reinhard_preds, reinhard_gts, reinhard_fvd_metric)
     fvd_update(pu_preds, pu_gts, pu_fvd_metric)
+    fvd_update(reinhard_preds_firstfit, reinhard_gts, reinhard_fvd_first_metric)
+    fvd_update(pu_preds_firstfit, pu_gts, pu_fvd_first_metric)
 
     del reinhard_preds, reinhard_gts, pu_preds, pu_gts, hdr_preds, hdr_gts, im_paths
     gc.collect()
@@ -340,11 +419,16 @@ R_FID   = float(compute_fid(reinhard_fid_metric))
 R_FVD   = float(compute_fvd(reinhard_fvd_metric))
 PU_FID  = float(compute_fid(pu_fid_metric))
 PU_FVD  = float(compute_fvd(pu_fvd_metric))
+R_FVD_FIRST = float(compute_fvd(reinhard_fvd_first_metric))
+PU_FVD_FIRST = float(compute_fvd(pu_fvd_first_metric))
+
 
 print("R-FID Score:", R_FID)
 print("R-FVD Score:", R_FVD)
 print("PU-FID Score:", PU_FID)
 print("PU-FVD Score:", PU_FVD)
+print("R-FVD-FIRST Score:", R_FVD_FIRST)
+print("PU-FVD-FIRST Score:", PU_FVD_FIRST)
 print("Average PU-PSNR:", float(np.mean(np.array(psnr_scores))))
 print("Average PU-VSI:",  float(np.mean(np.array(vsi_scores))))
 print("Average PIQE:",    float(np.mean(np.array(piqe_scores))))
@@ -359,27 +443,17 @@ LPIPS   = float(np.mean(np.array(lpips_scores))) if len(lpips_scores) else float
 HDR_VDP3 = float(np.mean(np.array(hdrvdp3_scores))) if len(hdrvdp3_scores) else float("nan")
 CVVDP   = float(np.mean(np.array(cvvdp_scores))) if len(cvvdp_scores) else float("nan")
 
-# (optional) also save std-devs for sanity
-PU_PSNR_s  = float(np.std(np.array(psnr_scores))) if len(psnr_scores) else float("nan")
-PU_VSI_s   = float(np.std(np.array(vsi_scores)))  if len(vsi_scores)  else float("nan")
-PIQE_s     = float(np.std(np.array(piqe_scores))) if len(piqe_scores) else float("nan")
-LPIPS_s    = float(np.std(np.array(lpips_scores))) if len(lpips_scores) else float("nan")
-HDR_VDP3_s = float(np.std(np.array(hdrvdp3_scores))) if len(hdrvdp3_scores) else float("nan")
-CVVDP_s    = float(np.std(np.array(cvvdp_scores))) if len(cvvdp_scores) else float("nan")
 
 # --- write CSV ---
 out_csv = Path(EVAL_OUTPUT_DIR) / f"results_{args.method}_{args.dataset}_{args.type}_{NUM_FILES}_ds{DS}.csv"
 Path(EVAL_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 fieldnames = [
     "CVVDP", "HDR-VDP3", "PU-PSNR", "PU-VSI", "PIQE", "LPIPS",
-    "R-FID", "R-FVD", "PU-FID", "PU-FVD",
-    "CVVDP-STD", "HDR-VDP3-STD", "PU-PSNR-STD", "PU-VSI-STD", "PIQE-STD", "LPIPS-STD",
+    "R-FID", "R-FVD", "PU-FID", "PU-FVD", "R-FVD-FIRST", "PU-FVD-FIRST",
 ]
 row = {
     "CVVDP": CVVDP, "HDR-VDP3": HDR_VDP3, "PU-PSNR": PU_PSNR, "PU-VSI": PU_VSI, "PIQE": PIQE, "LPIPS": LPIPS,
-    "R-FID": R_FID, "R-FVD": R_FVD, "PU-FID": PU_FID, "PU-FVD": PU_FVD,
-    "CVVDP-STD": CVVDP_s, "HDR-VDP3-STD": HDR_VDP3_s, "PU-PSNR-STD": PU_PSNR_s,
-    "PU-VSI-STD": PU_VSI_s, "PIQE-STD": PIQE_s, "LPIPS-STD": LPIPS_s
+    "R-FID": R_FID, "R-FVD": R_FVD, "PU-FID": PU_FID, "PU-FVD": PU_FVD, "R-FVD-FIRST": R_FVD_FIRST, "PU-FVD-FIRST": PU_FVD_FIRST
 }
 
 with open(out_csv, "w", newline="") as f:

@@ -84,6 +84,8 @@ def run_one_task(
     ds: int,
     gpu_id: Optional[str] = None,
     workers_per_gpu: int = 1,
+    videos: Optional[List[str]] = None,
+    videos_exclude: Optional[List[str]] = None,
 ) -> Tuple[Task, bool]:
     """Run compute_metrics_parallel_siddhu.py for one (dataset, method, type). Returns (task, success)."""
     dataset, method, type_name = task
@@ -98,6 +100,10 @@ def run_one_task(
         return (task, False)
 
     cmd = [sys.executable, str(script), dataset, method, type_name, "--num-files", str(num_files), "--ds", str(ds)]
+    if videos:
+        cmd += ["--videos", ",".join(videos)]
+    if videos_exclude:
+        cmd += ["--videos-exclude", ",".join(videos_exclude)]
 
     env = os.environ.copy()
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -129,6 +135,8 @@ def _gpu_worker(
     num_files: int,
     ds: int,
     workers_per_gpu: int,
+    videos: Optional[List[str]],
+    videos_exclude: Optional[List[str]],
 ) -> None:
     """
     One worker pinned to one GPU. It pulls tasks from task_q and reports to result_q.
@@ -143,7 +151,13 @@ def _gpu_worker(
             break
 
         t, ok = run_one_task(
-            task, num_files, ds, gpu_id=gpu_id, workers_per_gpu=workers_per_gpu
+            task,
+            num_files,
+            ds,
+            gpu_id=gpu_id,
+            workers_per_gpu=workers_per_gpu,
+            videos=videos,
+            videos_exclude=videos_exclude,
         )
         result_q.put((t, ok, gpu_id))
 
@@ -177,11 +191,20 @@ def _parse_gpus(s: Optional[str]) -> Optional[List[str]]:
     return gpus if gpus else None
 
 
+def _parse_videos(s: Optional[str]) -> Optional[List[str]]:
+    if s is None:
+        return None
+    vids = [x.strip() for x in s.split(",") if x.strip() != ""]
+    return vids if vids else None
+
+
 def _run_round(
     tasks: List[Task],
     args: argparse.Namespace,
     num_files: int,
     ds: int,
+    videos: Optional[List[str]],
+    videos_exclude: Optional[List[str]],
 ) -> List[Task]:
     """Run one round of tasks (GPU or CPU). Returns list of failed tasks (empty if all ok)."""
     failed: List[Task] = []
@@ -199,7 +222,16 @@ def _run_round(
             for _ in range(workers_per_gpu):
                 p = Process(
                     target=_gpu_worker,
-                    args=(gpu_id, task_q, result_q, num_files, ds, workers_per_gpu),
+                    args=(
+                        gpu_id,
+                        task_q,
+                        result_q,
+                        num_files,
+                        ds,
+                        workers_per_gpu,
+                        videos,
+                        videos_exclude,
+                    ),
                     daemon=True,
                 )
                 p.start()
@@ -228,7 +260,7 @@ def _run_round(
     workers = max(1, min(args.workers, len(tasks)))
     with ProcessPoolExecutor(max_workers=workers) as ex:
         futures = {
-            ex.submit(run_one_task, t, num_files, ds): t
+            ex.submit(run_one_task, t, num_files, ds, None, 1, videos, videos_exclude): t
             for t in tasks
         }
         for fut in as_completed(futures):
@@ -325,6 +357,20 @@ def parse_args():
         action="store_true",
         help="Include santos ubc over (e.g. over20) in metrics. By default these are excluded.",
     )
+    parser.add_argument(
+        "--videos",
+        type=str,
+        default=None,
+        metavar="V1,V2,...",
+        help="Optional comma-separated video folder names to pass to compute script.",
+    )
+    parser.add_argument(
+        "--videos-exclude",
+        type=str,
+        default=None,
+        metavar="V1,V2,...",
+        help="Optional comma-separated video folder names to exclude in compute script.",
+    )
     return parser.parse_args()
 
 
@@ -332,6 +378,8 @@ def main():
     args = parse_args()
     num_files = args.num_files
     ds = max(1, args.ds)
+    videos = _parse_videos(args.videos)
+    videos_exclude = _parse_videos(args.videos_exclude)
 
     if args.types is not None and not getattr(args, "all", False):
         allowed = {s.strip() for s in args.types.split(",") if s.strip()}
@@ -383,7 +431,7 @@ def main():
         if args.dry_run:
             return 0
 
-        failed = _run_round(tasks, args, num_files, ds)
+        failed = _run_round(tasks, args, num_files, ds, videos, videos_exclude)
         if failed:
             print("Some tasks failed (will retry next round):", failed, file=sys.stderr)
 
