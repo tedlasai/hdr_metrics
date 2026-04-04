@@ -14,7 +14,7 @@ GPU-parallel mode:
   --workers-per-gpu K -> spawns K workers per GPU (total workers = len(gpus)*K)
 
 CPU-parallel mode (default when --gpus is not set):
-  --workers N -> ProcessPoolExecutor like before.
+  --workers N -> ProcessPoolExecutor like before.ss
 """
 
 import argparse
